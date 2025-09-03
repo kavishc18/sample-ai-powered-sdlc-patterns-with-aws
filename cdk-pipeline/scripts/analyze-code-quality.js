@@ -1,248 +1,144 @@
-#!/usr/bin/env node
-
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { BedrockRuntimeClient, InvokeModelCommand } = require("@aws-sdk/client-bedrock-runtime");
+const stringify = require('json-stable-stringify');
 
-console.log('Starting Code Quality Analysis...');
-
-try {
-  // Check if this is a TypeScript project
-  const tsconfigPath = path.join(process.cwd(), 'tsconfig.json');
-  const packageJsonPath = path.join(process.cwd(), 'package.json');
-  
-  if (!fs.existsSync(packageJsonPath)) {
-    console.error('package.json not found');
-    process.exit(1);
-  }
-
-  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-  
-  // Basic code quality checks
-  let issues = [];
-  let warnings = [];
-
-  // Check if TypeScript is configured properly
-  if (fs.existsSync(tsconfigPath)) {
-    console.log('✓ TypeScript configuration found');
-    
+async function analyzeCodeQuality() {
     try {
-      // Try to compile TypeScript
-      execSync('npx tsc --noEmit', { stdio: 'pipe' });
-      console.log('✓ TypeScript compilation successful');
-    } catch (error) {
-      console.warn('⚠️  TypeScript compilation has issues');
-      warnings.push('TypeScript compilation warnings');
-    }
-  }
+        console.log('Starting code quality analysis...');
+        console.log('Current directory:', process.cwd());
 
-  // Check for essential scripts
-  const requiredScripts = ['build', 'test'];
-  const scripts = packageJson.scripts || {};
-  
-  for (const script of requiredScripts) {
-    if (!scripts[script]) {
-      warnings.push(`Missing ${script} script in package.json`);
-    } else {
-      console.log(`✓ ${script} script found`);
-    }
-  }
-
-  // Check for CDK-specific patterns
-  const cdkPatterns = {
-    hasConstructs: false,
-    hasCdkLib: false,
-    hasProperStructure: false
-  };
-
-  if (packageJson.dependencies) {
-    if (packageJson.dependencies['constructs']) {
-      cdkPatterns.hasConstructs = true;
-      console.log('✓ Constructs dependency found');
-    }
-    if (packageJson.dependencies['aws-cdk-lib']) {
-      cdkPatterns.hasCdkLib = true;
-      console.log('✓ AWS CDK lib dependency found');
-    }
-  }
-
-  // Check project structure
-  const expectedDirs = ['bin', 'lib'];
-  let structureScore = 0;
-  
-  for (const dir of expectedDirs) {
-    if (fs.existsSync(dir)) {
-      structureScore++;
-      console.log(`✓ ${dir}/ directory found`);
-    } else {
-      warnings.push(`Missing ${dir}/ directory`);
-    }
-  }
-
-  if (structureScore === expectedDirs.length) {
-    cdkPatterns.hasProperStructure = true;
-  }
-
-  // Check for common code quality issues
-  const filesToCheck = ['bin/', 'lib/'];
-  let codeQualityScore = 100;
-
-  for (const dir of filesToCheck) {
-    if (fs.existsSync(dir)) {
-      try {
-        const files = execSync(`find ${dir} -name "*.ts" -o -name "*.js"`, { encoding: 'utf8' })
-          .split('\n')
-          .filter(f => f.trim());
-
-        for (const file of files) {
-          if (fs.existsSync(file)) {
-            const content = fs.readFileSync(file, 'utf8');
-            
-            // Check for TODO/FIXME comments
-            const todoMatches = content.match(/TODO|FIXME|HACK/gi);
-            if (todoMatches) {
-              warnings.push(`${todoMatches.length} TODO/FIXME comments in ${file}`);
-              codeQualityScore -= 2;
-            }
-
-            // Check for console.log (should use proper logging)
-            const consoleMatches = content.match(/console\.log/g);
-            if (consoleMatches) {
-              warnings.push(`${consoleMatches.length} console.log statements in ${file}`);
-              codeQualityScore -= 1;
-            }
-
-            // Check for proper error handling
-            if (content.includes('catch') && !content.includes('throw')) {
-              warnings.push(`Potential silent error handling in ${file}`);
-              codeQualityScore -= 3;
-            }
-          }
+        // Read templates from the templates directory
+        const templatesDir = './templates';
+        console.log('Reading templates from:', templatesDir);
+        
+        if (!fs.existsSync('./templates')) {
+            throw new Error(`Templates directory not found at: ${templatesDir}`);
         }
-      } catch (error) {
-        console.log(`No files found in ${dir} or error scanning: ${error.message}`);
-      }
+
+        const templateFiles = fs.readdirSync('./templates')
+            .filter(file => file.endsWith('.template.json'));
+        
+        const templates = [];
+        for (const fileName of templateFiles) {
+            // Validate filename to prevent path traversal
+            if (fileName.includes('..') || fileName.includes('/') || fileName.includes('\\')) {
+                continue; // Skip potentially malicious filenames
+            }
+            
+            const resolvedPath = path.resolve('./templates', fileName);
+            const baseDir = path.resolve('./templates');
+            
+            // Ensure the resolved path is within the templates directory
+            if (!resolvedPath.startsWith(baseDir)) {
+                continue; // Skip paths that escape the directory
+            }
+            
+            templates.push({
+                name: fileName,
+                content: JSON.parse(fs.readFileSync('./templates/' + fileName, 'utf8'))
+            });
+        }
+
+        if (templates.length === 0) {
+            throw new Error('No template files found in templates directory');
+        }
+
+        // Combine all templates into a single object
+        const combinedTemplate = {
+            Templates: templates.reduce((acc, template) => {
+                acc[template.name] = template.content;
+                return acc;
+            }, {})
+        };
+
+        // Generate report
+        console.log('Analyzing combined templates...');
+        const analysis = await callBedrock(combinedTemplate);
+
+        let overallReport = '# Application Code Quality Analysis Report\n\n';
+        overallReport += `Generated: ${new Date().toISOString()}\n\n`;
+        overallReport += analysis;
+
+        // Write report
+        const reportPath = 'code_quality_report.md';
+        fs.writeFileSync(reportPath, overallReport);
+        console.log(`Analysis report generated successfully at: ${reportPath}`);
+        console.log('Report content:');
+        console.log(overallReport);
+
+    } catch (error) {
+        console.error('Error in code quality analysis:', error);
+        console.error('Stack trace:', error.stack);
+        process.exit(1);
     }
-  }
+}
 
-  // Generate report
-  const finalScore = Math.max(0, codeQualityScore);
-  const reportContent = generateMarkdownReport(finalScore, warnings, issues, cdkPatterns);
-  
-  // Write report to file
-  fs.writeFileSync('code_quality_report.md', reportContent);
-  
-  console.log('\n📊 Code Quality Report:');
-  console.log(`Code Quality Score: ${finalScore}/100`);
-  console.log('Report saved to: code_quality_report.md');
-  
-  if (warnings.length > 0) {
-    console.log('\n⚠️  Warnings:');
-    warnings.forEach(warning => console.log(`  - ${warning}`));
-  }
+async function callBedrock(combinedTemplate) {
+    const client = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+    const bedrockRequest = {
+        modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+        contentType: "application/json",
+        accept: "application/json",
+        body: stringify({
+            anthropic_version: "bedrock-2023-05-31",
+            max_tokens: 4000,
+            messages: [{
+                role: "user",
+                content: `Analyze this set of AWS CloudFormation templates for an application stack. Provide a comprehensive quality analysis focusing on architecture, security, and best practices across all templates:
 
-  if (issues.length > 0) {
-    console.log('\n❌ Issues:');
-    issues.forEach(issue => console.log(`  - ${issue}`));
+Combined Templates:
+${stringify(combinedTemplate, { space: 2 })}
+
+Please provide a holistic analysis covering:
+
+1. Overall Stack Overview
+- High-level architecture and design patterns
+- Resource relationships and dependencies across templates
+- Service integrations and their purposes
+
+2. Comprehensive Quality Assessment
+- Resource configurations and their consistency across templates
+- Security settings and potential vulnerabilities
+- Error handling and resilience strategies
+- Scalability and performance considerations
+
+3. Best Practices Review
+- Alignment with AWS Well-Architected Framework
+- Infrastructure as Code patterns and template structure
+- Consistency in resource naming and tagging across templates
+- Security best practices implementation
+
+4. Recommendations
+- High-priority improvements for the overall stack
+- Security enhancements across all templates
+- Performance and scalability optimizations
+- Cost optimization opportunities
+
+5. Cross-template Considerations
+- Consistency and standardization across templates
+- Potential for consolidation or modularization
+- Inter-template dependencies and potential issues
+
+Format your response as a clear, comprehensive markdown report with specific examples and actionable recommendations that consider the entire application stack across all templates.`
+            }]
+        })
+    };
+
+    console.log('Calling Bedrock for analysis...');
+    const command = new InvokeModelCommand(bedrockRequest);
+    const response = await client.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+    if (!responseBody?.content?.[0]?.text) {
+        throw new Error('Invalid response from Bedrock');
+    }
+
+    return responseBody.content[0].text;
+}
+
+// Run the analysis
+analyzeCodeQuality().catch(error => {
+    console.error('Unhandled error:', error);
     process.exit(1);
-  }
-
-  if (codeQualityScore >= 70) {
-    console.log('\n✅ Code Quality Analysis passed');
-    process.exit(0);
-  } else {
-    console.log('\n⚠️  Code Quality Analysis completed with warnings');
-    console.log('Consider addressing the warnings to improve code quality.');
-    process.exit(0);
-  }
-
-} catch (error) {
-  console.error('Code Quality Analysis failed:', error.message);
-  process.exit(1);
-}
-
-function generateMarkdownReport(score, warnings, issues, cdkPatterns) {
-  const timestamp = new Date().toISOString();
-  const status = score >= 70 ? '✅ PASSED' : '⚠️ WARNING';
-  
-  let report = `# Code Quality Analysis Report
-
-**Generated:** ${timestamp}  
-**Status:** ${status}  
-**Score:** ${score}/100
-
-## Summary
-
-This report contains the results of the automated code quality analysis for the CDK project.
-
-### CDK Project Validation
-- **Constructs Library:** ${cdkPatterns.hasConstructs ? '✅ Found' : '❌ Missing'}
-- **AWS CDK Library:** ${cdkPatterns.hasCdkLib ? '✅ Found' : '❌ Missing'}
-- **Project Structure:** ${cdkPatterns.hasProperStructure ? '✅ Valid' : '❌ Invalid'}
-
-## Analysis Results
-
-### Score Breakdown
-- **Base Score:** 100
-- **Final Score:** ${score}
-- **Threshold:** 70 (minimum passing score)
-
-`;
-
-  if (issues.length > 0) {
-    report += `### ❌ Critical Issues (${issues.length})
-${issues.map(issue => `- ${issue}`).join('\n')}
-
-`;
-  }
-
-  if (warnings.length > 0) {
-    report += `### ⚠️ Warnings (${warnings.length})
-${warnings.map(warning => `- ${warning}`).join('\n')}
-
-`;
-  }
-
-  if (issues.length === 0 && warnings.length === 0) {
-    report += `### ✅ No Issues Found
-All code quality checks passed successfully.
-
-`;
-  }
-
-  report += `## Recommendations
-
-`;
-
-  if (score < 70) {
-    report += `- **Action Required:** Address the issues above to improve code quality
-- Review and fix critical issues first
-- Consider implementing additional code quality tools
-`;
-  } else if (warnings.length > 0) {
-    report += `- Consider addressing the warnings to further improve code quality
-- Implement consistent coding standards
-- Add more comprehensive testing
-`;
-  } else {
-    report += `- Maintain current code quality standards
-- Continue following best practices
-- Consider adding more advanced quality checks
-`;
-  }
-
-  report += `
-## Next Steps
-
-1. Review any issues or warnings listed above
-2. Implement fixes for critical issues
-3. Consider adding automated code formatting (Prettier, ESLint)
-4. Add unit tests if not present
-5. Set up pre-commit hooks for quality checks
-
----
-*Report generated by CDK Pipeline Code Quality Analysis*
-`;
-
-  return report;
-}
+});
