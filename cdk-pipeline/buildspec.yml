@@ -1,0 +1,33 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo "Installing dependencies..."
+      - npm ci
+      
+  pre_build:
+    commands:
+      - echo "Running pre-build checks..."
+      - echo "SAST Analysis"
+      - node $CODEBUILD_SRC_DIR/cdk-pipeline/scripts/analyze-sast.js
+      - echo "Code Quality Analysis"
+      - node ./cdk-pipeline/scripts/analyze-code-quality.js
+      
+  build:
+    commands:
+      - echo "Building the project..."
+      - npm run build
+      - echo "Running CDK synth..."
+      - npx cdk synth
+      
+  post_build:
+    commands:
+      - echo "Build completed successfully"
+      
+artifacts:
+  files:
+    - '**/*'
+  name: cdk-artifacts
